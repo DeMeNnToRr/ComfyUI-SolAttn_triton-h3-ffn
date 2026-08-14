@@ -191,7 +191,8 @@ def _ineligible(q, k, mask, dim_head, min_tokens):
 
 def _run(q, k, v, heads, skip_reshape, skip_output_reshape, scale,
          tau, min_tokens, verbose, int8_qk=False, sink_blocks=(0, 0),
-         sink_q=(0, 0), use_tma=False, int8_pv=True):
+         sink_q=(0, 0), use_tma=False, int8_pv=True,
+         route_coverage=0.0, min_exact_fraction=0.0):
     """Returns the attention output, or None if this call should stay dense."""
     if skip_reshape:
         b, _, _, dim_head = q.shape          # BHND
@@ -215,7 +216,8 @@ def _run(q, k, v, heads, skip_reshape, skip_output_reshape, scale,
     out = kernel(
         qs, ks, vs,
         scale=scale, tau=tau, sink_blocks=sink_blocks, sink_q=sink_q,
-        use_tma=use_tma, **extra,
+        use_tma=use_tma, route_coverage=route_coverage,
+        min_exact_fraction=min_exact_fraction, **extra,
     )  # BTHD
     _stats["sparse"] += 1
     if verbose:
@@ -253,11 +255,16 @@ def _sink_blocks(transformer_options, tokens, mode):
     return blocks, (blocks if mode == "exact_kv_and_rows" else (0, 0))
 
 
+def _int8_for_tokens(int8_qk, tokens, int8_min_tokens):
+    return bool(int8_qk and (int8_min_tokens is None or tokens >= int8_min_tokens))
+
+
 def make_override(tau=1.0, min_tokens=4096,
                   sigma_start=None, sigma_end=None, verbose=False,
                   int8_qk=False, sink_conditioning="exact_kv", use_tma=False,
                   dense_blocks=frozenset(), tau_profile=None, int8_pv=True,
-                  previous=None):
+                  int8_min_tokens=None, route_coverage=0.0,
+                  min_exact_fraction=0.0, previous=None):
     """Build an optimized_attention_override callable.
 
     ``previous`` chains any override already installed on the model: every path
@@ -307,10 +314,11 @@ def make_override(tau=1.0, min_tokens=4096,
                       f"conditioning sink: KV blocks {sink} exact, dense query blocks {sink_q}")
 
         try:
+            use_int8 = _int8_for_tokens(int8_qk, tokens, int8_min_tokens)
             out = _run(q, k, v, heads, skip_reshape, skip_output_reshape,
                        kwargs.get("scale", None), block_tau,
-                       min_tokens, verbose, int8_qk, sink, sink_q, use_tma,
-                       int8_pv)
+                       min_tokens, verbose, use_int8, sink, sink_q, use_tma,
+                       int8_pv, route_coverage, min_exact_fraction)
         except Exception as exc:
             _stats["errors"] += 1
             _log_kernel_failure(exc)
@@ -436,6 +444,13 @@ class SolAttnPatch(io.ComfyNode):
                 io.Float.Input("tau", default=1.3, min=0.0, max=4.0, step=0.05,
                                tooltip="Threshold beta. Higher is sparser: 1.0 ~ 16% of "
                                        "blocks kept exact, 1.5 ~ 7%, 2.0 ~ 2.7%."),
+                io.Float.Input("route_coverage", default=0.0, min=0.0, max=1.0, step=0.01,
+                               tooltip="Optional accepted-block planner. 0 keeps tau routing; "
+                                       "otherwise a stable exact-block mask is selected until this "
+                                       "estimated attention-mass coverage is reached."),
+                io.Float.Input("min_exact_fraction", default=0.0, min=0.0, max=1.0, step=0.05,
+                               tooltip="Minimum fraction of KV blocks retained exactly when the "
+                                       "accepted-block planner is enabled."),
                 io.Float.Input("start_percent", default=0.2, min=0.0, max=1.0, step=0.01,
                                tooltip="Run dense before this point. The paper uses 0.2."),
                 io.Float.Input("end_percent", default=0.9, min=0.0, max=1.0, step=0.01),
@@ -504,7 +519,9 @@ class SolAttnPatch(io.ComfyNode):
     def execute(cls, model, tau, start_percent, end_percent,
                 min_tokens, int8_qk, sink_conditioning, morton,
                 morton_curve, dense_blocks, verbose,
-                tau_profile=None, use_tma=False, int8_pv=True) -> io.NodeOutput:
+                tau_profile=None, use_tma=False, int8_pv=True,
+                int8_min_tokens=None, route_coverage=0.0,
+                min_exact_fraction=0.0) -> io.NodeOutput:
         if _sol_attn_kernel is None:
             raise RuntimeError(f"Sol-Attn kernel unavailable: {_IMPORT_ERROR}")
         if int8_qk and _sol_attn_int8_kernel is None:
@@ -597,13 +614,68 @@ class SolAttnPatch(io.ComfyNode):
                           verbose=verbose, int8_qk=int8_qk,
                           sink_conditioning=sink_conditioning,
                           use_tma=use_tma, dense_blocks=dense,
-                          tau_profile=profile, int8_pv=int8_pv, previous=previous)
+                          tau_profile=profile, int8_pv=int8_pv,
+                          int8_min_tokens=int8_min_tokens,
+                          route_coverage=route_coverage,
+                          min_exact_fraction=min_exact_fraction,
+                          previous=previous)
         if reorder:
             m.model_options["transformer_options"]["sol_morton"] = True
             m.model_options["transformer_options"]["sol_morton_curve"] = morton_curve
         _set_autotune_verbose(verbose)
         reset_sol_attn_stats()
         return io.NodeOutput(m)
+
+
+class MiniMaxH3FastPatch(io.ComfyNode):
+    """Long-sequence H3 candidate using an explicit accepted-block plan."""
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="MiniMaxH3FastPatch",
+            display_name="MiniMax H3 Long-Sequence Attention (Experimental)",
+            is_experimental=True,
+            category="sol_attn/minimax_h3",
+            description="H3-only Sol-Attn candidate from 12K tokens. Builds an explicit "
+                        "accepted-block mask with 90% estimated mass coverage and a 50% "
+                        "exact floor, then uses the stable grouped INT8 QK/PV kernel. "
+                        "Conditioning query/KV rows and sensitive transformer blocks stay dense.",
+            inputs=[
+                io.Model.Input("model"),
+                io.Boolean.Input("enabled", default=False,
+                                 tooltip="Explicit opt-in; disabled preserves dense attention."),
+                io.Boolean.Input("verbose", default=False, advanced=True),
+            ],
+            outputs=[io.Model.Output()],
+        )
+
+    @classmethod
+    def execute(cls, model, enabled=False, verbose=False) -> io.NodeOutput:
+        if not enabled:
+            return io.NodeOutput(model)
+        diffusion_model = model.get_model_object("diffusion_model")
+        if not (hasattr(diffusion_model, "rope_freqs") and
+                hasattr(diffusion_model, "_forward") and
+                hasattr(diffusion_model, "blocks")):
+            raise ValueError("MiniMax H3 Fast Attention requires a MiniMax H3 MODEL")
+        return SolAttnPatch.execute(
+            model=model,
+            tau=1.2,
+            start_percent=0.2,
+            end_percent=0.9,
+            min_tokens=12288,
+            int8_qk=True,
+            sink_conditioning="exact_kv_and_rows",
+            morton=False,
+            morton_curve="2d_frame",
+            dense_blocks="0-2,-1",
+            verbose=verbose,
+            int8_pv=True,
+            int8_min_tokens=None,
+            route_coverage=0.9,
+            min_exact_fraction=0.5,
+        )
 
 
 class SolAttnBlockProbe(io.ComfyNode):
@@ -677,7 +749,7 @@ if os.environ.get("SOL_ATTN", "0") not in ("0", "", "false"):
 
 class SolAttnExtension(ComfyExtension):
     async def get_node_list(self):
-        return [SolAttnPatch, SolAttnBlockProbe]
+        return [SolAttnPatch, MiniMaxH3FastPatch, SolAttnBlockProbe]
 
 
 async def comfy_entrypoint() -> SolAttnExtension:

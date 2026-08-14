@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import torch
 import triton
 import triton.language as tl
@@ -13,6 +15,7 @@ BLOCK_SIZE = 64
 # kc/vc are zero-padded to this many blocks so group tiles load unmasked;
 # covers every GROUP the forward kernels autotune over.
 GROUP_PAD = 64
+_LOGGED_ROUTE_PLANS = set()
 
 
 def tau_vector(tau, heads, device):
@@ -242,6 +245,92 @@ def _compute_diag_threshold(
     return global_threshold
 
 
+def build_route_plan(
+    q: torch.Tensor,
+    kc: torch.Tensor,
+    *,
+    tokens: int,
+    scale: float,
+    coverage: float,
+    min_exact_fraction: float,
+    sink_blocks: tuple[int, int] = (0, 0),
+    sink_q: tuple[int, int] = (0, 0),
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build an explicit exact-block plan in ``[B, query, H, key]`` order.
+
+    Blocks are accepted in descending estimated attention mass until ``coverage``
+    is reached, with a fixed exact-block floor. Local and conditioning blocks are
+    mandatory. The forward consumes the mask through its stable grouped exact loop.
+    """
+    if not 0.0 < coverage <= 1.0:
+        raise ValueError("coverage must be in (0, 1]")
+    if not 0.0 <= min_exact_fraction <= 1.0:
+        raise ValueError("min_exact_fraction must be in [0, 1]")
+
+    batch, _, heads, head_dim = q.shape
+    blocks = triton.cdiv(tokens, BLOCK_SIZE)
+    full_blocks, tail = divmod(tokens, BLOCK_SIZE)
+    centroids = []
+    if full_blocks:
+        full = q[:, :full_blocks * BLOCK_SIZE].unflatten(
+            1, (full_blocks, BLOCK_SIZE)
+        )
+        centroids.append(full.mean(dim=2, dtype=torch.float32))
+    if tail:
+        centroids.append(q[:, full_blocks * BLOCK_SIZE:tokens].mean(
+            dim=1, dtype=torch.float32
+        ).unsqueeze(1))
+    q_centroids = torch.cat(centroids, dim=1).to(kc.dtype)
+
+    # [B,H,Q,K]. A key-mean shift, used by the INT8 path, adds the same value
+    # to every K score and therefore leaves this ranking and normalized mass intact.
+    scores = torch.matmul(
+        q_centroids.permute(0, 2, 1, 3),
+        kc[:, :blocks].permute(0, 2, 3, 1),
+    ).float().mul_(float(scale))
+    lengths = torch.full(
+        (blocks,), BLOCK_SIZE, device=q.device, dtype=torch.float32
+    )
+    lengths[-1] = tokens - (blocks - 1) * BLOCK_SIZE
+    mass = torch.softmax(scores + lengths.log().view(1, 1, 1, blocks), dim=-1)
+    order = scores.argsort(dim=-1, descending=True)
+    sorted_mass = mass.gather(-1, order)
+    required = (sorted_mass.cumsum(dim=-1) < coverage).sum(dim=-1) + 1
+    floor = max(1, int(blocks * min_exact_fraction + 0.999999))
+    required.clamp_(min=floor, max=blocks)
+
+    positions = torch.arange(blocks, device=q.device).view(1, 1, 1, blocks)
+    selected_sorted = positions < required.unsqueeze(-1)
+    selected = torch.zeros_like(selected_sorted).scatter_(-1, order, selected_sorted)
+
+    q_index = torch.arange(blocks, device=q.device).view(1, 1, blocks, 1)
+    k_index = torch.arange(blocks, device=q.device).view(1, 1, 1, blocks)
+    selected |= (q_index - k_index).abs() <= 1
+    sink_start, sink_end = (max(0, int(x)) for x in sink_blocks)
+    selected[..., sink_start:min(sink_end, blocks)] = True
+    sink_q_start, sink_q_end = (max(0, int(x)) for x in sink_q)
+    selected[:, :, sink_q_start:min(sink_q_end, blocks), :] = True
+
+    counts = selected.sum(dim=-1, dtype=torch.int32)
+    key = (tokens, heads, coverage, min_exact_fraction, sink_blocks, sink_q)
+    if key not in _LOGGED_ROUTE_PLANS:
+        _LOGGED_ROUTE_PLANS.add(key)
+        active = counts[:, :, min(sink_q_end, blocks):]
+        observed = active if active.numel() else counts
+        logging.info(
+            "[sol_attn] accepted-block plan: %d blocks, exact min/mean/max "
+            "%.1f%%/%.1f%%/%.1f%%",
+            blocks,
+            100.0 * observed.min().item() / blocks,
+            100.0 * observed.float().mean().item() / blocks,
+            100.0 * observed.max().item() / blocks,
+        )
+    return (
+        selected.permute(0, 2, 1, 3).contiguous().to(torch.uint8),
+        counts.permute(0, 2, 1).contiguous(),
+    )
+
+
 def prepare(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -257,4 +346,4 @@ def prepare(
     return kc, vc, threshold
 
 
-__all__ = ["prepare"]
+__all__ = ["build_route_plan", "prepare"]

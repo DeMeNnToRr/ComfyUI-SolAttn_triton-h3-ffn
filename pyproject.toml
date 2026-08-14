@@ -1,0 +1,20 @@
+[project]
+name = "minimax-h3-sol-attn-rocm"
+version = "1.0.0"
+description = "Validated MiniMax H3 long-sequence Sol-Attn patch for AMD ROCm with conservative accepted-block routing."
+requires-python = ">=3.10"
+dependencies = []
+classifiers = [
+  "Operating System :: POSIX :: Linux",
+  "Environment :: GPU :: AMD ROCm",
+]
+
+[project.urls]
+Repository = "https://github.com/DrBearJew/ComfyUI-SolAttn_triton"
+Documentation = "https://github.com/DrBearJew/ComfyUI-SolAttn_triton/blob/h3-community-r01/H3_COMMUNITY_R01.md"
+"Bug Tracker" = "https://github.com/DrBearJew/ComfyUI-SolAttn_triton/issues"
+
+[tool.comfy]
+PublisherId = "dbj"
+DisplayName = "MiniMax H3 Sol-Attn (ROCm)"
+requires-comfyui = ">=0.32.0,<0.33.0"

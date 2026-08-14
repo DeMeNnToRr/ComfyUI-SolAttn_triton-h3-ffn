@@ -191,7 +191,7 @@ def _forward_int8(
 def _forward_int8_ptr(
     q_ptr, kc_ptr, vc_ptr, o_ptr,
     qi_ptr, qs_ptr, ki_ptr, ks_ptr, vi_ptr, vsc_ptr, v_ptr,
-    threshold,
+    threshold, route_mask_ptr,
     scale,
     sink_start,
     sink_end,
@@ -209,6 +209,7 @@ def _forward_int8_ptr(
     BLOCK_SIZE: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
     INT8_PV: tl.constexpr,
+    USE_ROUTE_TABLE: tl.constexpr,
 ):
     # Same math as _forward_int8. q/v/o mask their ragged token tails; kc/vc
     # are GROUP-padded allocations and load unmasked.
@@ -250,8 +251,9 @@ def _forward_int8_ptr(
     row_max = tl.full((BLOCK_SIZE,), -float("inf"), tl.float32)
     scale_log2 = scale * 1.4426950408889634
     tail_length = T - (NT - 1) * BLOCK_SIZE
-    route_threshold = tl.load(threshold + (batch * NT + q_block) * H + head)
-    q_in_sink = (q_block >= sink_q_start) & (q_block < sink_q_end)
+    if not USE_ROUTE_TABLE:
+        route_threshold = tl.load(threshold + (batch * NT + q_block) * H + head)
+        q_in_sink = (q_block >= sink_q_start) & (q_block < sink_q_end)
 
     for group_start in range(0, NT, GROUP_SIZE):
         block_indices = group_start + group_offsets
@@ -267,13 +269,21 @@ def _forward_int8_ptr(
 
         # --- routing + approximate correction, BF16 ---
         scores = tl.dot(q, kc.T).to(tl.float32) * scale_log2
-        sink_kv = (block_indices >= sink_start) & (block_indices < sink_end)
-        routed = (
-            (tl.sum(scores, axis=0) / q_len > route_threshold)
-            | (tl.abs(q_block - block_indices) <= 1)
-            | sink_kv
-        ) & valid
-        exact = tl.where(q_in_sink, valid, routed)
+        if USE_ROUTE_TABLE:
+            exact = tl.load(
+                route_mask_ptr
+                + (((batch * NT + q_block) * H + head) * NT + block_indices),
+                mask=valid,
+                other=0,
+            ).to(tl.int1)
+        else:
+            sink_kv = (block_indices >= sink_start) & (block_indices < sink_end)
+            routed = (
+                (tl.sum(scores, axis=0) / q_len > route_threshold)
+                | (tl.abs(q_block - block_indices) <= 1)
+                | sink_kv
+            ) & valid
+            exact = tl.where(q_in_sink, valid, routed)
 
         approximate = valid & ~exact
         approximate_scores = tl.where(approximate[None, :], scores, -float("inf"))
@@ -352,11 +362,13 @@ _wrap_autotune(_forward_int8_ptr, "int8 forward (pointer)")
 
 
 def sol_attn_int8(q, k, v, *, scale=None, tau=1.0, sink_blocks=(0, 0), sink_q=(0, 0),
-                  use_tma=False, int8_pv=True):
+                  use_tma=False, int8_pv=True, route_coverage=0.0,
+                  min_exact_fraction=0.0):
     """Sol-Attn with an INT8 exact branch. Same contract as the BF16 kernel."""
     scale = q.shape[-1] ** -0.5 if scale is None else float(scale)
     batch, _, heads, head_dim = q.shape
-    use_tma = use_tma and _has_tma(q.device)
+    use_route_table = float(route_coverage) > 0.0
+    use_tma = use_tma and not use_route_table and _has_tma(q.device)
     if use_tma:
         q, tokens, padded = _to_blocks(q, BLOCK)
         # k and v only feed the strided preprocess kernels; the forward reaches
@@ -372,9 +384,14 @@ def sol_attn_int8(q, k, v, *, scale=None, tau=1.0, sink_blocks=(0, 0), sink_q=(0
         tokens = padded = q.shape[1]
     blocks = triton.cdiv(tokens, BLOCK)
 
-    kc, vc, threshold, qi, qs, ki, ks, vi, vsc = fused_preprocess(
+    (
+        kc, vc, threshold, qi, qs, ki, ks, vi, vsc,
+        route_mask, _,
+    ) = fused_preprocess(
         q, k, v, tau=tau, scale=scale, tokens=tokens,
-        int8_pv=int8_pv,
+        int8_pv=int8_pv, route_coverage=route_coverage,
+        min_exact_fraction=min_exact_fraction,
+        sink_blocks=sink_blocks, sink_q=sink_q,
     )
     del k  # the forward reaches K only as ki/ks
     if vi is None:
@@ -387,7 +404,7 @@ def sol_attn_int8(q, k, v, *, scale=None, tau=1.0, sink_blocks=(0, 0), sink_q=(0
         _forward_int8_ptr[grid](
             q, kc, vc, output,
             qi, qs, ki, ks, vi, vsc, v,
-            threshold,
+            threshold, route_mask,
             scale,
             int(sink_blocks[0]),
             int(sink_blocks[1]),
@@ -403,6 +420,7 @@ def sol_attn_int8(q, k, v, *, scale=None, tau=1.0, sink_blocks=(0, 0), sink_q=(0
             NT=blocks,
             BLOCK_SIZE=BLOCK,
             INT8_PV=int8_pv,
+            USE_ROUTE_TABLE=use_route_table,
         )
         return output[:, :tokens]
     block_shape = [1, BLOCK, 1, head_dim]

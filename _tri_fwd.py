@@ -16,7 +16,7 @@ except Exception:
     TensorDescriptor = None
 
 from ._autotune_log import AUTOTUNE_EXTRAS as _AUTOTUNE_EXTRAS, wrap as _wrap_autotune
-from ._preprocess import prepare
+from ._preprocess import build_route_plan, prepare
 
 _logged_no_descriptor = False
 
@@ -209,7 +209,7 @@ def _forward(
 )
 @triton.jit
 def _forward_ptr(
-    q_ptr, k_ptr, v_ptr, kc_ptr, vc_ptr, threshold, o_ptr,
+    q_ptr, k_ptr, v_ptr, kc_ptr, vc_ptr, threshold, route_mask_ptr, o_ptr,
     scale,
     sink_start,
     sink_end,
@@ -227,6 +227,7 @@ def _forward_ptr(
     BV: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
+    USE_ROUTE_TABLE: tl.constexpr,
 ):
     # Same math as _forward. q/k/v/o mask their ragged token tails; kc/vc are
     # GROUP-padded allocations and load unmasked. q/k/v take explicit strides
@@ -256,10 +257,11 @@ def _forward_ptr(
     row_max = tl.full((BLOCK_SIZE,), -float("inf"), tl.float32)
     scale_log2 = scale * 1.4426950408889634
     tail_length = T - (NT - 1) * BLOCK_SIZE
-    route_threshold = tl.load(
-        threshold + (batch * NT + q_block) * H + head
-    )
-    q_in_sink = (q_block >= sink_q_start) & (q_block < sink_q_end)
+    if not USE_ROUTE_TABLE:
+        route_threshold = tl.load(
+            threshold + (batch * NT + q_block) * H + head
+        )
+        q_in_sink = (q_block >= sink_q_start) & (q_block < sink_q_end)
 
     for group_start in range(0, NT, GROUP_SIZE):
         block_indices = group_start + group_offsets
@@ -273,13 +275,21 @@ def _forward_ptr(
             + bv_offsets[None, :]
         )
         scores = tl.dot(q, kc.T).to(tl.float32) * scale_log2
-        sink_kv = (block_indices >= sink_start) & (block_indices < sink_end)
-        routed = (
-            (tl.sum(scores, axis=0) / q_len > route_threshold)
-            | (tl.abs(q_block - block_indices) <= 1)
-            | sink_kv
-        ) & valid
-        exact = tl.where(q_in_sink, valid, routed)
+        if USE_ROUTE_TABLE:
+            exact = tl.load(
+                route_mask_ptr
+                + (((batch * NT + q_block) * H + head) * NT + block_indices),
+                mask=valid,
+                other=0,
+            ).to(tl.int1)
+        else:
+            sink_kv = (block_indices >= sink_start) & (block_indices < sink_end)
+            routed = (
+                (tl.sum(scores, axis=0) / q_len > route_threshold)
+                | (tl.abs(q_block - block_indices) <= 1)
+                | sink_kv
+            ) & valid
+            exact = tl.where(q_in_sink, valid, routed)
 
         approximate = valid & ~exact
         approximate_scores = tl.where(
@@ -357,6 +367,8 @@ def sol_attn(
     sink_blocks: tuple = (0, 0),
     sink_q: tuple = (0, 0),
     use_tma: bool = False,
+    route_coverage: float = 0.0,
+    min_exact_fraction: float = 0.0,
 ) -> torch.Tensor:
     """Run Sol-Attn on BTHD inputs.
 
@@ -368,7 +380,8 @@ def sol_attn(
     scale = q.shape[-1] ** -0.5 if scale is None else float(scale)
     tau = float(tau)
     batch, _, heads, head_dim = q.shape
-    use_tma = use_tma and _has_tma(q.device)
+    use_route_table = float(route_coverage) > 0.0
+    use_tma = use_tma and not use_route_table and _has_tma(q.device)
     if use_tma:
         q, tokens, padded = _to_blocks(q, BLOCK)
         k, _, _ = _to_blocks(k, BLOCK)
@@ -381,12 +394,21 @@ def sol_attn(
         tokens = padded = q.shape[1]
     blocks = triton.cdiv(tokens, BLOCK)
     kc, vc, threshold = prepare(q, k, v, scale=scale, tau=tau, tokens=tokens)
+    if use_route_table:
+        route_mask, _ = build_route_plan(
+            q, kc, tokens=tokens, scale=scale,
+            coverage=float(route_coverage),
+            min_exact_fraction=float(min_exact_fraction),
+            sink_blocks=sink_blocks, sink_q=sink_q,
+        )
+    else:
+        route_mask = threshold
     output = torch.empty((batch, padded, heads, head_dim),
                          device=v.device, dtype=v.dtype)
     if not use_tma:
         grid = lambda META: (head_dim // META["BV"], blocks, batch * heads)
         _forward_ptr[grid](
-            q, k, v, kc, vc, threshold, output,
+            q, k, v, kc, vc, threshold, route_mask, output,
             scale,
             int(sink_blocks[0]),
             int(sink_blocks[1]),
@@ -402,6 +424,7 @@ def sol_attn(
             D=head_dim,
             NT=blocks,
             BLOCK_SIZE=BLOCK,
+            USE_ROUTE_TABLE=use_route_table,
         )
         return output[:, :tokens]
     block_shape = [1, BLOCK, 1, head_dim]

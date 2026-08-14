@@ -9,7 +9,7 @@ import torch
 import triton
 import triton.language as tl
 
-from ._preprocess import _reduce_kv, BLOCK_SIZE, tau_vector
+from ._preprocess import _reduce_kv, BLOCK_SIZE, build_route_plan, tau_vector
 from ._fused_quant import quantize_bthd, quantize_v_per_channel
 
 
@@ -59,8 +59,10 @@ def _q_quant_threshold_kernel(
              TAU * tl.sqrt(variance + 1.0e-6))
 
 
-def fused_preprocess(q, k, v, *, tau, scale, tokens=None, int8_pv=True):
-    """Returns (kc, vc, threshold, qi, qs, ki, ks, vi, vsc) with K smoothed.
+def fused_preprocess(q, k, v, *, tau, scale, tokens=None, int8_pv=True,
+                     route_coverage=0.0, min_exact_fraction=0.0,
+                     sink_blocks=(0, 0), sink_q=(0, 0)):
+    """Returns summaries, quantized tensors, and an optional exact-block plan.
 
     ``tokens`` is the true sequence length; q may be padded past it (TMA path).
     """
@@ -90,7 +92,19 @@ def fused_preprocess(q, k, v, *, tau, scale, tokens=None, int8_pv=True):
         tau_vector(tau, H, q.device),
         num_warps=4,
     )
-    return kc, vc, threshold, qi, qs, ki, ks, vi, vsc
+    if float(route_coverage) > 0.0:
+        route_mask, route_counts = build_route_plan(
+            q, kc, tokens=T, scale=scale,
+            coverage=float(route_coverage),
+            min_exact_fraction=float(min_exact_fraction),
+            sink_blocks=sink_blocks, sink_q=sink_q,
+        )
+    else:
+        route_mask = route_counts = threshold
+    return (
+        kc, vc, threshold, qi, qs, ki, ks, vi, vsc,
+        route_mask, route_counts,
+    )
 
 
 __all__ = ["fused_preprocess"]
