@@ -21,6 +21,7 @@ from comfy.patcher_extension import CallbacksMP
 from comfy_api.latest import ComfyExtension, io
 
 from ._autotune_log import set_verbose as _set_autotune_verbose
+from ._h3_chunk_ffn import MiniMaxH3ChunkFeedForward
 
 try:
     from ._tri_fwd import sol_attn as _sol_attn_kernel, _has_tma
@@ -749,8 +750,29 @@ if os.environ.get("SOL_ATTN", "0") not in ("0", "", "false"):
 
 class SolAttnExtension(ComfyExtension):
     async def get_node_list(self):
-        return [SolAttnPatch, MiniMaxH3FastPatch, SolAttnBlockProbe]
+        return [
+            SolAttnPatch,
+            MiniMaxH3FastPatch,
+            SolAttnBlockProbe,
+            MiniMaxH3ChunkFeedForward,
+        ]
 
 
 async def comfy_entrypoint() -> SolAttnExtension:
     return SolAttnExtension()
+
+
+# Legacy compatibility for H3 Multishot.
+try:
+    import nodes as _nodes
+
+    _nodes.NODE_CLASS_MAPPINGS.setdefault(
+        "MiniMaxH3ChunkFeedForward",
+        MiniMaxH3ChunkFeedForward,
+    )
+except Exception as _exc:
+    logging.warning(
+        "[SolAttn] Could not register MiniMaxH3ChunkFeedForward "
+        "in legacy NODE_CLASS_MAPPINGS: %s",
+        _exc,
+    )
